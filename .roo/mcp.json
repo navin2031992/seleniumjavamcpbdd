@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "selenium": {
+      "command": "npx",
+      "args": ["-y", "@angiejones/mcp-selenium@latest"],
+      "disabled": false,
+      "alwaysAllow": [
+        "start_browser",
+        "navigate",
+        "interact",
+        "send_keys",
+        "get_element_text",
+        "get_element_attribute",
+        "press_key",
+        "take_screenshot",
+        "execute_script",
+        "window",
+        "frame",
+        "alert",
+        "add_cookie",
+        "get_cookies",
+        "delete_cookie",
+        "diagnostics",
+        "close_session",
+        "upload_file"
+      ]
+    }
+  }
+}
