@@ -1,0 +1,14 @@
+<!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">
+<suite name="BDD Selenium Framework" verbose="1" thread-count="1">
+
+    <listeners>
+        <listener class-name="com.automation.core.AllureTestListener"/>
+    </listeners>
+
+    <test name="Regression Tests">
+        <classes>
+            <class name="com.automation.runners.TestRunner"/>
+        </classes>
+    </test>
+
+</suite>

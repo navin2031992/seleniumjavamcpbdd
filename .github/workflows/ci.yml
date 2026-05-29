@@ -1,0 +1,209 @@
+name: 🤖 BDD Selenium CI
+
+on:
+  push:
+    branches: [ main, develop, 'feature/**', 'hotfix/**' ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Nightly regression run at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [ dev, staging, prod ]
+      browser:
+        description: 'Browser'
+        required: true
+        default: 'chrome'
+        type: choice
+        options: [ chrome, firefox, edge ]
+      tags:
+        description: 'Cucumber tag filter'
+        required: false
+        default: '@smoke'
+
+env:
+  JAVA_VERSION: '17'
+  MAVEN_OPTS: '-Xmx2g -XX:+TieredCompilation -XX:TieredStopAtLevel=1'
+
+jobs:
+
+  # ── Job 1: Compile & Lint ──────────────────────────────────────────────────
+  build:
+    name: 🔨 Compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Compile
+        run: mvn compile -q
+
+      - name: Upload compiled classes
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-classes
+          path: target/classes
+          retention-days: 1
+
+  # ── Job 2: Smoke Tests ────────────────────────────────────────────────────
+  smoke:
+    name: 💨 Smoke Tests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Run Smoke Tests
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          JIRA_API_TOKEN:     ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          mvn test -Pci \
+            -Denv=${{ github.event.inputs.env || 'staging' }} \
+            -Dbrowser=${{ github.event.inputs.browser || 'chrome' }} \
+            -Dheadless=true \
+            '-Dcucumber.filter.tags=@smoke' \
+            -q
+
+      - name: Upload Allure results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-smoke
+          path: target/allure-results
+          retention-days: 7
+
+  # ── Job 3: Regression Tests (parallel) ────────────────────────────────────
+  regression:
+    name: 🔁 Regression [${{ matrix.browser }}]
+    needs: smoke
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [ chrome, firefox ]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Setup ${{ matrix.browser }}
+        uses: browser-actions/setup-chrome@v1
+        if: matrix.browser == 'chrome'
+      - uses: browser-actions/setup-firefox@v1
+        if: matrix.browser == 'firefox'
+
+      - name: Run Regression Tests
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          mvn test -Pci \
+            -Denv=${{ github.event.inputs.env || 'staging' }} \
+            -Dbrowser=${{ matrix.browser }} \
+            -Dheadless=true \
+            '-Dcucumber.filter.tags=@regression' \
+            -q
+
+      - name: Upload Allure results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-regression-${{ matrix.browser }}
+          path: target/allure-results
+          retention-days: 14
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ matrix.browser }}
+          path: target/screenshots
+          retention-days: 7
+
+  # ── Job 4: Allure Report ───────────────────────────────────────────────────
+  report:
+    name: 📊 Allure Report
+    needs: [ smoke, regression ]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all Allure results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: allure-*
+          merge-multiple: true
+          path: target/allure-results
+
+      - name: Generate Allure Report
+        uses: simple-elf/allure-report-action@master
+        with:
+          allure_results: target/allure-results
+          allure_history: allure-history
+          keep_reports: 20
+
+      - name: Deploy report to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: allure-history
+
+  # ── Job 5: AI Test Generation (on demand) ─────────────────────────────────
+  ai-generate:
+    name: 🤖 AI Test Generation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.tags == '@generate'
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Generate Tests from Jira
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          JIRA_BASE_URL:      ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USERNAME:      ${{ secrets.JIRA_USERNAME }}
+          JIRA_API_TOKEN:     ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          mvn exec:java \
+            -Dexec.mainClass="com.automation.agents.AgentOrchestrator" \
+            -Dexec.args="--generate-from-jira"
+
+      - name: Commit generated tests
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: 'src/test/resources/features src/test/java/com/automation/steps src/test/java/com/automation/pages'
+          message: '🤖 Auto-generated tests from Jira [skip ci]'
+          author_name: 'Test Generator Bot'
+          author_email: 'bot@ci.local'

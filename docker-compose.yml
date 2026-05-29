@@ -1,0 +1,112 @@
+version: '3.8'
+
+services:
+
+  # ── Selenium Grid Hub ─────────────────────────────────────────
+  selenium-hub:
+    image: selenium/hub:4.18.1
+    container_name: selenium-hub
+    ports:
+      - "4442:4442"
+      - "4443:4443"
+      - "4444:4444"
+    environment:
+      - GRID_MAX_SESSION=10
+      - GRID_BROWSER_TIMEOUT=300
+      - GRID_TIMEOUT=300
+    networks:
+      - selenium-grid
+
+  # ── Chrome Nodes ──────────────────────────────────────────────
+  chrome:
+    image: selenium/node-chrome:4.18.1
+    container_name: selenium-chrome
+    depends_on:
+      - selenium-hub
+    environment:
+      - SE_EVENT_BUS_HOST=selenium-hub
+      - SE_EVENT_BUS_PUBLISH_PORT=4442
+      - SE_EVENT_BUS_SUBSCRIBE_PORT=4443
+      - SE_NODE_MAX_SESSIONS=4
+      - VNC_NO_PASSWORD=1
+      - SCREEN_WIDTH=1920
+      - SCREEN_HEIGHT=1080
+    ports:
+      - "7900:7900"   # noVNC debug port (http://localhost:7900)
+    volumes:
+      - /dev/shm:/dev/shm
+    networks:
+      - selenium-grid
+    # To run multiple Chrome nodes: docker-compose up --scale chrome=2
+
+  # ── Firefox Node ──────────────────────────────────────────────
+  firefox:
+    image: selenium/node-firefox:4.18.1
+    container_name: selenium-firefox
+    depends_on:
+      - selenium-hub
+    environment:
+      - SE_EVENT_BUS_HOST=selenium-hub
+      - SE_EVENT_BUS_PUBLISH_PORT=4442
+      - SE_EVENT_BUS_SUBSCRIBE_PORT=4443
+      - SE_NODE_MAX_SESSIONS=2
+    volumes:
+      - /dev/shm:/dev/shm
+    networks:
+      - selenium-grid
+
+  # ── Test Executor ─────────────────────────────────────────────
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: test-runner
+    depends_on:
+      - selenium-hub
+      - chrome
+    environment:
+      - TEST_ENV=staging
+      - BROWSER=chrome
+      - HEADLESS=true
+      - grid.url=http://selenium-hub:4444
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - JIRA_BASE_URL=${JIRA_BASE_URL:-}
+      - JIRA_USERNAME=${JIRA_USERNAME:-}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN:-}
+    volumes:
+      - ./target/allure-results:/app/target/allure-results
+      - ./target/screenshots:/app/target/screenshots
+      - ./target/cucumber-reports:/app/target/cucumber-reports
+    networks:
+      - selenium-grid
+    profiles:
+      - test
+
+  # ── Allure Report Server ──────────────────────────────────────
+  allure-server:
+    image: frankescobar/allure-docker-service:2.27.0
+    container_name: allure-server
+    environment:
+      - CHECK_RESULTS_EVERY_SECONDS=3
+      - KEEP_HISTORY=20
+      - KEEP_HISTORY_LATEST=20
+    ports:
+      - "5050:5050"
+    volumes:
+      - ./target/allure-results:/app/allure-results
+      - ./target/allure-reports:/app/default-reports
+    networks:
+      - selenium-grid
+    profiles:
+      - reports
+
+networks:
+  selenium-grid:
+    driver: bridge
+
+# Usage:
+#   docker-compose up -d selenium-hub chrome firefox
+#   docker-compose --profile test run --rm test-runner
+#   docker-compose --profile reports up -d allure-server
+#   open http://localhost:5050 for Allure reports
+#   open http://localhost:7900 for Chrome VNC

@@ -1,0 +1,36 @@
+{
+  "users": [
+    {
+      "role": "standard",
+      "email": "test@example.com",
+      "password": "Password123!",
+      "displayName": "Test User",
+      "environment": ["dev", "staging"]
+    },
+    {
+      "role": "admin",
+      "email": "admin@example.com",
+      "password": "Admin@123!",
+      "displayName": "Admin",
+      "environment": ["dev", "staging"]
+    },
+    {
+      "role": "manager",
+      "email": "manager@example.com",
+      "password": "Manager@123!",
+      "displayName": "Manager",
+      "environment": ["dev", "staging"]
+    },
+    {
+      "role": "readonly",
+      "email": "viewer@example.com",
+      "password": "Viewer@123!",
+      "displayName": "Viewer",
+      "environment": ["dev"]
+    }
+  ],
+  "invalid": {
+    "email": "invalid@notexist.com",
+    "password": "WrongPass99!"
+  }
+}
