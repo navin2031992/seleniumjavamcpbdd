@@ -18,86 +18,149 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Java client for @angiejones/mcp-selenium (v0.2.3+).
  * https://github.com/angiejones/mcp-selenium
  *
- * Real tools (18 total):
- *   Browser :  start_browser, navigate, close_session
- *   Interact:  interact, send_keys, press_key, upload_file
- *   Inspect :  get_element_text, get_element_attribute
- *   Capture :  take_screenshot, execute_script
- *   Windows :  window, frame, alert
- *   Cookies :  add_cookie, get_cookies, delete_cookie
- *   Debug   :  diagnostics
- *
- * Resources (read-only):
- *   browser-status://current  — active session ID or "No active browser session"
- *   accessibility://current   — page accessibility tree as JSON
- *
- * Locator strategies accepted by element-targeting tools:
- *   "id" | "css" | "xpath" | "name" | "tag" | "class"
+ * Fixed bugs in this version:
+ *   1. Windows ProcessBuilder — npx must be invoked via "cmd.exe /c npx" on Windows
+ *      because npx is a .cmd batch script, not a native executable.
+ *   2. Stderr consumer — a daemon thread drains the subprocess stderr pipe so it
+ *      never deadlocks (OS pipe buffer is typically only 64 KB).
+ *   3. Startup delay — Node.js needs ~1-2 s to load the module before it can
+ *      respond to JSON-RPC messages; the handshake now waits for readiness.
+ *   4. Removed MCP_TRANSPORT env var — not used by mcp-selenium, was noise.
  *
  * Lifecycle:
- *   1. new MCPSeleniumClient()
- *   2. start()          — launches `npx -y @angiejones/mcp-selenium@latest`
- *   3. startBrowser()   — opens the browser (must call BEFORE any interaction)
- *   4. ... use tools ...
- *   5. closeBrowser()   — closes the browser session
- *   6. stop()           — kills the Node.js process
+ *   1. start()          — launches `npx -y @angiejones/mcp-selenium@latest`, completes handshake
+ *   2. startBrowser()   — opens the browser  ← must call before any element tools
+ *   3. ... use tools ...
+ *   4. closeBrowser()   — closes the browser session
+ *   5. stop()           — kills the Node.js process
  */
 public class MCPSeleniumClient {
 
     private static final Logger log = LogManager.getLogger(MCPSeleniumClient.class);
     private static final ObjectMapper mapper = new ObjectMapper();
 
+    /** Maximum ms to wait for Node.js to become ready before sending the handshake. */
+    private static final long STARTUP_WAIT_MS = 2_500;
+
+    /** Maximum ms to wait for any individual JSON-RPC response. */
+    private static final long REQUEST_TIMEOUT_MS = 30_000;
+
     private final ConfigManager config = ConfigManager.getInstance();
     private final AtomicInteger idCounter = new AtomicInteger(1);
     private final ConcurrentHashMap<Integer, CompletableFuture<MCPMessage>> pending =
         new ConcurrentHashMap<>();
 
-    private Process mcpProcess;
+    private Process   mcpProcess;
     private PrintWriter stdin;
-    private Thread readerThread;
+    private Thread    readerThread;
+    private Thread    stderrThread;
     private volatile boolean running = false;
 
     // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-    /** Launch the Node.js MCP server subprocess and complete the MCP handshake. */
+    /**
+     * Launch the Node.js MCP server subprocess and complete the MCP handshake.
+     * Safe to call on Windows, macOS, and Linux.
+     */
     public void start() throws IOException {
         log.info("Starting mcp-selenium server...");
 
-        String nodePath = config.getMcpNodePath();
-        String npx = nodePath.equals("node") ? "npx"
-            : nodePath.replace("node", "npx").replace("node.exe", "npx.cmd");
-
-        ProcessBuilder pb = new ProcessBuilder(npx, "-y", "@angiejones/mcp-selenium@latest");
-        pb.environment().put("MCP_TRANSPORT", "stdio");
-        pb.redirectErrorStream(false);
+        ProcessBuilder pb = new ProcessBuilder(buildNpxCommand());
+        pb.redirectErrorStream(false);   // keep stderr separate so we can drain it
 
         mcpProcess = pb.start();
-        running = true;
+        running    = true;
+        log.info("mcp-selenium process started (PID: {})", mcpProcess.pid());
 
+        // ── Drain stderr (BUG FIX #2) ─────────────────────────────────────────
+        // If stderr is never read, the OS pipe buffer fills (~64 KB) and the
+        // subprocess blocks indefinitely. We consume it in a daemon thread and
+        // log every line at DEBUG so diagnostics remain accessible.
+        stderrThread = new Thread(() -> {
+            try (BufferedReader err = new BufferedReader(
+                    new InputStreamReader(mcpProcess.getErrorStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = err.readLine()) != null) {
+                    log.debug("[mcp-stderr] {}", line);
+                }
+            } catch (IOException ignored) {}
+        }, "mcp-stderr");
+        stderrThread.setDaemon(true);
+        stderrThread.start();
+
+        // ── stdin writer ──────────────────────────────────────────────────────
         stdin = new PrintWriter(
             new OutputStreamWriter(mcpProcess.getOutputStream(), StandardCharsets.UTF_8), true);
 
+        // ── stdout reader ─────────────────────────────────────────────────────
         readerThread = new Thread(this::readLoop, "mcp-reader");
         readerThread.setDaemon(true);
         readerThread.start();
 
+        // ── Wait for Node.js to finish loading (BUG FIX #3) ─────────────────
+        // Node.js needs ~1-2 s to resolve and load @angiejones/mcp-selenium before
+        // it can handle JSON-RPC messages. Sending the handshake too early causes
+        // a 30-second timeout.  We poll the process-alive state and pause briefly.
+        waitForProcessReady();
+
+        // ── MCP handshake ─────────────────────────────────────────────────────
         handshake();
-        log.info("mcp-selenium ready (PID: {})", mcpProcess.pid());
+        log.info("mcp-selenium ready");
+    }
+
+    /**
+     * Build the platform-correct npx command.
+     *
+     * On Windows, npx is npx.cmd — a batch script. ProcessBuilder does NOT
+     * invoke the shell, so running "npx" directly fails with:
+     *   IOException: Cannot run program "npx": CreateProcess error=2
+     * The fix is to invoke cmd.exe /c which does resolve .cmd extensions.
+     */
+    private List<String> buildNpxCommand() {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        String pkg = "@angiejones/mcp-selenium@latest";
+
+        if (os.contains("windows")) {
+            // cmd /c ensures Windows resolves npx.cmd from PATH
+            log.debug("Detected Windows — using cmd.exe /c npx");
+            return List.of("cmd.exe", "/c", "npx", "-y", pkg);
+        }
+
+        // macOS / Linux: npx is a plain shell script, directly executable
+        log.debug("Detected Unix — using npx directly");
+        return List.of("npx", "-y", pkg);
+    }
+
+    /** Poll until the Node.js process is alive and has had time to load its module. */
+    private void waitForProcessReady() {
+        long deadline = System.currentTimeMillis() + STARTUP_WAIT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            if (!mcpProcess.isAlive()) {
+                throw new RuntimeException(
+                    "mcp-selenium process exited immediately with code "
+                    + mcpProcess.exitValue()
+                    + ". Check that Node.js >= 18 and npx are installed.");
+            }
+            try { Thread.sleep(200); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        log.debug("Startup wait complete — sending MCP handshake");
     }
 
     /**
      * Open a browser window using the system-installed binary.
-     * For Edge the mcp-selenium Node.js driver finds msedge.exe automatically
-     * from the OS application registry — no separate browser download occurs.
+     * MUST be called after start() and before any interact/navigate calls.
      *
      * @param browser  "edge" | "chrome" | "firefox" | "safari"
-     * @param headless true for CI / headless execution
+     * @param headless true for headless/CI execution
      */
     public MCPMessage startBrowser(String browser, boolean headless) {
         Map<String, Object> options = new HashMap<>();
         options.put("headless", headless);
 
-        // Edge-specific: suppress the first-run welcome screen and default-browser nag
+        // Edge-specific: suppress first-run wizard and default-browser nag
         if ("edge".equalsIgnoreCase(browser)) {
             options.put("arguments", List.of(
                 "--no-first-run",
@@ -107,13 +170,13 @@ public class MCPSeleniumClient {
         }
 
         log.info("Opening {} browser (headless={})", browser, headless);
-        return callTool("start_browser", Map.of(
-            "browser", browser.toLowerCase(),
+        return callTool("start_browser", mapOf(
+            "browser", browser.toLowerCase(Locale.ROOT),
             "options", options
         ));
     }
 
-    /** Convenience overload — uses browser and headless from ConfigManager. */
+    /** Convenience overload — reads browser and headless from ConfigManager. */
     public MCPMessage startBrowser() {
         return startBrowser(config.getBrowser(), config.isHeadless());
     }
@@ -123,73 +186,59 @@ public class MCPSeleniumClient {
         return callTool("close_session", Map.of());
     }
 
-    /** Kill the Node.js subprocess. */
+    /** Kill the Node.js subprocess and clean up threads. */
     public void stop() {
         running = false;
         if (mcpProcess != null) {
             mcpProcess.destroyForcibly();
-            log.info("mcp-selenium stopped");
         }
+        log.info("mcp-selenium stopped");
     }
 
     // ── Navigation ─────────────────────────────────────────────────────────────
 
-    /** Navigate the browser to a URL. */
     public MCPMessage navigate(String url) {
-        return callTool("navigate", Map.of("url", url));
+        return callTool("navigate", mapOf("url", url));
     }
 
     // ── Element Interaction ────────────────────────────────────────────────────
 
     /**
-     * Click an element.
-     * @param by    locator strategy: "id" | "css" | "xpath" | "name" | "tag" | "class"
-     * @param value locator value (e.g. "#login-btn", "//button[@type='submit']")
+     * @param by    "id" | "css" | "xpath" | "name" | "tag" | "class"
+     * @param value the locator string (e.g. "#submit-btn", "//button[@type='submit']")
      */
     public MCPMessage click(String by, String value) {
-        return interact("click", by, value, 10000);
+        return interact("click", by, value, 10_000);
     }
 
-    /** Double-click an element. */
     public MCPMessage doubleClick(String by, String value) {
-        return interact("doubleclick", by, value, 10000);
+        return interact("doubleclick", by, value, 10_000);
     }
 
-    /** Right-click an element (context menu). */
     public MCPMessage rightClick(String by, String value) {
-        return interact("rightclick", by, value, 10000);
+        return interact("rightclick", by, value, 10_000);
     }
 
-    /** Hover over an element. */
     public MCPMessage hover(String by, String value) {
-        return interact("hover", by, value, 10000);
+        return interact("hover", by, value, 10_000);
     }
 
-    /**
-     * Perform a mouse action on an element.
-     * @param action "click" | "doubleclick" | "rightclick" | "hover"
-     */
     public MCPMessage interact(String action, String by, String value, int timeoutMs) {
-        return callTool("interact", Map.of(
-            "action", action,
-            "by",     by,
-            "value",  value,
+        return callTool("interact", mapOf(
+            "action",  action,
+            "by",      by,
+            "value",   value,
             "timeout", timeoutMs
         ));
     }
 
-    /**
-     * Type text into an element (clears the field first).
-     * @param by    locator strategy
-     * @param value locator value
-     * @param text  text to type
-     */
+    /** Type text into an element (clears the field first). */
     public MCPMessage sendKeys(String by, String value, String text) {
-        return sendKeys(by, value, text, 10000);
+        return sendKeys(by, value, text, 10_000);
     }
 
     public MCPMessage sendKeys(String by, String value, String text, int timeoutMs) {
-        return callTool("send_keys", Map.of(
+        return callTool("send_keys", mapOf(
             "by",      by,
             "value",   value,
             "text",    text,
@@ -197,20 +246,14 @@ public class MCPSeleniumClient {
         ));
     }
 
-    /**
-     * Press a keyboard key in the focused element.
-     * Common keys: Enter, Tab, Escape, Space, Backspace, ArrowDown, ArrowUp, F5
-     */
+    /** Press a keyboard key (Enter, Tab, Escape, Space, Backspace, ArrowDown, …). */
     public MCPMessage pressKey(String key) {
-        return callTool("press_key", Map.of("key", key));
+        return callTool("press_key", mapOf("key", key));
     }
 
-    /**
-     * Upload a file through a file input element.
-     * @param filePath absolute path to the file on the local machine
-     */
+    /** Upload a file via a file-input element. filePath must be absolute. */
     public MCPMessage uploadFile(String by, String value, String filePath) {
-        return callTool("upload_file", Map.of(
+        return callTool("upload_file", mapOf(
             "by",       by,
             "value",    value,
             "filePath", filePath
@@ -219,245 +262,138 @@ public class MCPSeleniumClient {
 
     // ── Element Inspection ─────────────────────────────────────────────────────
 
-    /** Get the visible text content of an element. */
     public MCPMessage getElementText(String by, String value) {
-        return getElementText(by, value, 10000);
+        return getElementText(by, value, 10_000);
     }
 
     public MCPMessage getElementText(String by, String value, int timeoutMs) {
-        return callTool("get_element_text", Map.of(
+        return callTool("get_element_text", mapOf(
             "by",      by,
             "value",   value,
             "timeout", timeoutMs
         ));
     }
 
-    /** Get the value of an HTML attribute on an element. */
     public MCPMessage getElementAttribute(String by, String value, String attribute) {
-        return callTool("get_element_attribute", Map.of(
+        return callTool("get_element_attribute", mapOf(
             "by",        by,
             "value",     value,
             "attribute", attribute
         ));
     }
 
-    // ── Screenshot & Script ───────────────────────────────────────────────────
+    // ── Screenshot & Script ────────────────────────────────────────────────────
 
-    /**
-     * Take a screenshot.
-     * @return MCPMessage whose result contains base64-encoded PNG data
-     */
+    /** Take a screenshot — result contains base64-encoded PNG. */
     public MCPMessage takeScreenshot() {
         return callTool("take_screenshot", Map.of());
     }
 
-    /**
-     * Take a screenshot and save it to a file.
-     * @param outputPath absolute path to save the PNG file
-     */
+    /** Take a screenshot and save to an absolute file path. */
     public MCPMessage takeScreenshot(String outputPath) {
-        return callTool("take_screenshot", Map.of("outputPath", outputPath));
+        return callTool("take_screenshot", mapOf("outputPath", outputPath));
     }
 
-    /**
-     * Execute arbitrary JavaScript in the browser context.
-     * @param script JavaScript code string
-     * @param args   optional arguments passed to the script as `arguments[0]`, `arguments[1]`, ...
-     */
     public MCPMessage executeScript(String script, Object... args) {
-        Map<String, Object> params = new HashMap<>();
-        params.put("script", script);
-        if (args.length > 0) params.put("args", Arrays.asList(args));
-        return callTool("execute_script", params);
+        Map<String, Object> p = new HashMap<>();
+        p.put("script", script);
+        if (args.length > 0) p.put("args", Arrays.asList(args));
+        return callTool("execute_script", p);
     }
 
-    // ── Convenience wrappers using execute_script ─────────────────────────────
+    // ── Convenience wrappers (use execute_script) ──────────────────────────────
 
-    /** Get the current page title. */
-    public String getPageTitle() {
-        MCPMessage result = executeScript("return document.title");
-        return extractText(result);
-    }
+    public String getPageTitle()  { return extractText(executeScript("return document.title")); }
+    public String getCurrentUrl() { return extractText(executeScript("return window.location.href")); }
+    public String getPageSource() { return extractText(executeScript("return document.documentElement.outerHTML")); }
 
-    /** Get the current page URL. */
-    public String getCurrentUrl() {
-        MCPMessage result = executeScript("return window.location.href");
-        return extractText(result);
-    }
-
-    /** Get the full outer HTML of the page. */
-    public String getPageSource() {
-        MCPMessage result = executeScript("return document.documentElement.outerHTML");
-        return extractText(result);
-    }
-
-    /** Count how many elements match a CSS selector. */
     public int countElements(String cssSelector) {
-        MCPMessage result = executeScript(
-            "return document.querySelectorAll(arguments[0]).length", cssSelector);
         try {
-            return Integer.parseInt(extractText(result).trim());
-        } catch (NumberFormatException e) {
-            return 0;
-        }
+            return Integer.parseInt(extractText(
+                executeScript("return document.querySelectorAll(arguments[0]).length", cssSelector)).trim());
+        } catch (NumberFormatException e) { return 0; }
     }
 
-    /** Check whether an element is present on the page. */
     public boolean isElementPresent(String by, String value) {
-        try {
-            MCPMessage result = getElementText(by, value, 2000);
-            return !result.isError();
-        } catch (Exception e) {
-            return false;
-        }
+        try { return !getElementText(by, value, 2_000).isError(); }
+        catch (Exception e) { return false; }
     }
 
-    // ── Window / Tab management ────────────────────────────────────────────────
+    // ── Window / Tab ───────────────────────────────────────────────────────────
 
-    /** List all open window handles. */
-    public MCPMessage listWindows() {
-        return callTool("window", Map.of("action", "list"));
-    }
+    public MCPMessage listWindows()              { return callTool("window", mapOf("action", "list")); }
+    public MCPMessage switchWindow(String h)     { return callTool("window", mapOf("action", "switch", "handle", h)); }
+    public MCPMessage switchToLatestWindow()     { return callTool("window", mapOf("action", "switch_latest")); }
+    public MCPMessage closeWindow()              { return callTool("window", mapOf("action", "close")); }
 
-    /** Switch focus to a specific window handle. */
-    public MCPMessage switchWindow(String handle) {
-        return callTool("window", Map.of("action", "switch", "handle", handle));
-    }
+    // ── Frame ──────────────────────────────────────────────────────────────────
 
-    /** Switch focus to the most recently opened window or tab. */
-    public MCPMessage switchToLatestWindow() {
-        return callTool("window", Map.of("action", "switch_latest"));
-    }
-
-    /** Close the current window or tab. */
-    public MCPMessage closeWindow() {
-        return callTool("window", Map.of("action", "close"));
-    }
-
-    // ── Frame management ───────────────────────────────────────────────────────
-
-    /** Switch into an iframe identified by a locator. */
     public MCPMessage switchToFrame(String by, String value) {
-        return callTool("frame", Map.of(
-            "action", "switch",
-            "by",     by,
-            "value",  value
-        ));
+        return callTool("frame", mapOf("action", "switch", "by", by, "value", value));
     }
 
-    /** Switch into an iframe by its zero-based index. */
     public MCPMessage switchToFrameByIndex(int index) {
-        return callTool("frame", Map.of("action", "switch", "index", index));
+        return callTool("frame", mapOf("action", "switch", "index", index));
     }
 
-    /** Return focus to the top-level document (exit all frames). */
     public MCPMessage switchToDefaultContent() {
-        return callTool("frame", Map.of("action", "default"));
+        return callTool("frame", mapOf("action", "default"));
     }
 
-    // ── Alert / Dialog handling ────────────────────────────────────────────────
+    // ── Alert ──────────────────────────────────────────────────────────────────
 
-    /** Accept the currently open alert/confirm/prompt dialog. */
-    public MCPMessage acceptAlert() {
-        return callTool("alert", Map.of("action", "accept"));
-    }
+    public MCPMessage acceptAlert()            { return callTool("alert", mapOf("action", "accept")); }
+    public MCPMessage dismissAlert()           { return callTool("alert", mapOf("action", "dismiss")); }
+    public MCPMessage getAlertText()           { return callTool("alert", mapOf("action", "get_text")); }
+    public MCPMessage sendAlertText(String t)  { return callTool("alert", mapOf("action", "send_text", "text", t)); }
 
-    /** Dismiss (cancel) the currently open alert/confirm dialog. */
-    public MCPMessage dismissAlert() {
-        return callTool("alert", Map.of("action", "dismiss"));
-    }
+    // ── Cookies ────────────────────────────────────────────────────────────────
 
-    /** Get the text of the currently open alert dialog. */
-    public MCPMessage getAlertText() {
-        return callTool("alert", Map.of("action", "get_text"));
-    }
-
-    /** Type text into a prompt dialog, then accept it. */
-    public MCPMessage sendAlertText(String text) {
-        return callTool("alert", Map.of("action", "send_text", "text", text));
-    }
-
-    // ── Cookie management ──────────────────────────────────────────────────────
-
-    /** Add a cookie to the current session. */
     public MCPMessage addCookie(String name, String value) {
-        return callTool("add_cookie", Map.of("name", name, "value", value));
+        return callTool("add_cookie", mapOf("name", name, "value", value));
     }
 
-    /** Add a cookie with full options (domain, path, secure, httpOnly, expiry). */
     public MCPMessage addCookie(String name, String value, String domain, String path,
                                 boolean secure, boolean httpOnly) {
-        Map<String, Object> params = new HashMap<>();
-        params.put("name", name);
-        params.put("value", value);
-        if (domain != null) params.put("domain", domain);
-        if (path != null)   params.put("path", path);
-        params.put("secure", secure);
-        params.put("httpOnly", httpOnly);
-        return callTool("add_cookie", params);
+        Map<String, Object> p = new HashMap<>();
+        p.put("name", name);   p.put("value", value);
+        if (domain != null) p.put("domain", domain);
+        if (path   != null) p.put("path",   path);
+        p.put("secure", secure);  p.put("httpOnly", httpOnly);
+        return callTool("add_cookie", p);
     }
 
-    /** Get all cookies for the current session. */
-    public MCPMessage getCookies() {
-        return callTool("get_cookies", Map.of());
-    }
+    public MCPMessage getCookies()              { return callTool("get_cookies",    Map.of()); }
+    public MCPMessage getCookie(String name)    { return callTool("get_cookies",    mapOf("name", name)); }
+    public MCPMessage deleteCookie(String name) { return callTool("delete_cookie",  mapOf("name", name)); }
+    public MCPMessage deleteAllCookies()        { return callTool("delete_cookie",  Map.of()); }
 
-    /** Get a specific cookie by name. */
-    public MCPMessage getCookie(String name) {
-        return callTool("get_cookies", Map.of("name", name));
-    }
+    // ── Diagnostics ────────────────────────────────────────────────────────────
 
-    /** Delete a specific cookie by name. */
-    public MCPMessage deleteCookie(String name) {
-        return callTool("delete_cookie", Map.of("name", name));
-    }
+    public MCPMessage getConsoleLogs(boolean clear)  { return callTool("diagnostics", mapOf("type", "console", "clear", clear)); }
+    public MCPMessage getBrowserErrors(boolean clear) { return callTool("diagnostics", mapOf("type", "errors",  "clear", clear)); }
+    public MCPMessage getNetworkLogs(boolean clear)  { return callTool("diagnostics", mapOf("type", "network", "clear", clear)); }
 
-    /** Delete ALL cookies for the current session. */
-    public MCPMessage deleteAllCookies() {
-        return callTool("delete_cookie", Map.of());
-    }
+    // ── Resources (read-only) ──────────────────────────────────────────────────
 
-    // ── Diagnostics (requires WebDriver BiDi) ─────────────────────────────────
+    /** "Active session: <id>" or "No active browser session". */
+    public MCPMessage getBrowserStatus()    { return readResource("browser-status://current"); }
 
-    /** Get captured browser console logs. @param clear whether to clear the buffer after reading */
-    public MCPMessage getConsoleLogs(boolean clear) {
-        return callTool("diagnostics", Map.of("type", "console", "clear", clear));
-    }
-
-    /** Get captured JavaScript errors. */
-    public MCPMessage getBrowserErrors(boolean clear) {
-        return callTool("diagnostics", Map.of("type", "errors", "clear", clear));
-    }
-
-    /** Get captured network requests/responses. */
-    public MCPMessage getNetworkLogs(boolean clear) {
-        return callTool("diagnostics", Map.of("type", "network", "clear", clear));
-    }
-
-    // ── Resources ─────────────────────────────────────────────────────────────
-
-    /** Read the current browser session status resource. */
-    public MCPMessage getBrowserStatus() {
-        return readResource("browser-status://current");
-    }
-
-    /** Read the page accessibility tree as JSON (useful for AI agents). */
-    public MCPMessage getAccessibilityTree() {
-        return readResource("accessibility://current");
-    }
+    /** Page accessibility tree as JSON — useful for AI agents to understand layout. */
+    public MCPMessage getAccessibilityTree() { return readResource("accessibility://current"); }
 
     // ── JSON-RPC core ──────────────────────────────────────────────────────────
 
     private MCPMessage callTool(String toolName, Map<String, Object> arguments) {
         Map<String, Object> params = new HashMap<>();
-        params.put("name", toolName);
+        params.put("name",      toolName);
         params.put("arguments", arguments);
-        log.debug("Calling MCP tool: {} {}", toolName, arguments);
+        log.debug("MCP tool → {}", toolName);
         return sendRequest("tools/call", params);
     }
 
     private MCPMessage readResource(String uri) {
-        return sendRequest("resources/read", Map.of("uri", uri));
+        return sendRequest("resources/read", mapOf("uri", uri));
     }
 
     private MCPMessage sendRequest(String method, Object params) {
@@ -466,15 +402,15 @@ public class MCPSeleniumClient {
         pending.put(id, future);
         writeMessage(MCPMessage.request(id, method, params));
         try {
-            MCPMessage response = future.get(30, TimeUnit.SECONDS);
+            MCPMessage response = future.get(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             if (response.isError()) {
-                log.error("MCP error [{}]: {}", response.getError().getCode(),
-                    response.getError().getMessage());
+                log.error("MCP error [{}] {}: {}",
+                    response.getError().getCode(), method, response.getError().getMessage());
             }
             return response;
         } catch (Exception e) {
             pending.remove(id);
-            throw new RuntimeException("MCP request failed: " + method, e);
+            throw new RuntimeException("MCP request failed [" + method + "]: " + e.getMessage(), e);
         }
     }
 
@@ -482,13 +418,14 @@ public class MCPSeleniumClient {
         writeMessage(MCPMessage.notification(method, params));
     }
 
-    private void writeMessage(MCPMessage msg) {
+    private synchronized void writeMessage(MCPMessage msg) {
         try {
             String json = mapper.writeValueAsString(msg);
             log.trace("MCP >> {}", json);
             stdin.println(json);
+            stdin.flush();
         } catch (Exception e) {
-            throw new RuntimeException("Failed to write MCP message", e);
+            throw new RuntimeException("Failed to serialize MCP message: " + e.getMessage(), e);
         }
     }
 
@@ -497,12 +434,19 @@ public class MCPSeleniumClient {
             new InputStreamReader(mcpProcess.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
             while (running && (line = reader.readLine()) != null) {
-                if (line.isBlank()) continue;
-                log.trace("MCP << {}", line);
-                handleIncoming(line);
+                String trimmed = line.trim();
+                if (trimmed.isEmpty()) continue;
+                log.trace("MCP << {}", trimmed);
+                handleIncoming(trimmed);
             }
         } catch (IOException e) {
-            if (running) log.error("MCP read error: {}", e.getMessage());
+            if (running) log.error("MCP reader stopped: {}", e.getMessage());
+        } finally {
+            // Complete any pending futures that are still waiting — prevents 30-s hangs
+            // if the process dies unexpectedly.
+            pending.forEach((id, future) ->
+                future.completeExceptionally(new IOException("mcp-selenium process terminated")));
+            pending.clear();
         }
     }
 
@@ -511,36 +455,44 @@ public class MCPSeleniumClient {
             MCPMessage msg = mapper.readValue(json, MCPMessage.class);
             if (msg.getId() != null) {
                 CompletableFuture<MCPMessage> future = pending.remove(msg.getId());
-                if (future != null) future.complete(msg);
+                if (future != null) {
+                    future.complete(msg);
+                } else {
+                    log.warn("No pending request for response id={}", msg.getId());
+                }
             }
+            // Server-initiated notifications (no id) are intentionally ignored
         } catch (Exception e) {
-            log.warn("Could not parse MCP message: {}", e.getMessage());
+            log.warn("Failed to parse MCP message '{}': {}", json, e.getMessage());
         }
     }
 
     // ── MCP Handshake ──────────────────────────────────────────────────────────
 
     private void handshake() {
-        Map<String, Object> params = Map.of(
-            "protocolVersion", "2024-11-05",
-            "clientInfo", Map.of("name", "java-selenium-bdd", "version", "1.0.0"),
-            "capabilities", Map.of()
-        );
+        log.debug("Sending MCP initialize...");
+        Map<String, Object> params = new HashMap<>();
+        params.put("protocolVersion", "2024-11-05");
+        params.put("clientInfo",  mapOf("name", "java-selenium-bdd", "version", "1.0.0"));
+        params.put("capabilities", Map.of());
+
         MCPMessage response = sendRequest("initialize", params);
         if (response.isError()) {
-            throw new RuntimeException("MCP handshake failed: " + response.getError().getMessage());
+            throw new RuntimeException(
+                "MCP handshake failed: " + response.getError().getMessage());
         }
+        log.debug("MCP initialize OK — sending initialized notification");
         sendNotification("notifications/initialized", null);
         log.info("MCP handshake complete");
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────────
+    // ── Utilities ──────────────────────────────────────────────────────────────
 
+    /** Extract text from a tools/call result: {content:[{type:"text",text:"..."}]}. */
     private String extractText(MCPMessage msg) {
         if (msg == null || msg.getResult() == null) return "";
         try {
             JsonNode node = mapper.valueToTree(msg.getResult());
-            // tools/call result: { content: [{ type: "text", text: "..." }] }
             if (node.has("content")) {
                 JsonNode first = node.path("content").get(0);
                 if (first != null && first.has("text")) return first.path("text").asText();
@@ -549,5 +501,18 @@ public class MCPSeleniumClient {
         } catch (Exception e) {
             return msg.getResult().toString();
         }
+    }
+
+    /**
+     * Mutable Map.of replacement that accepts an arbitrary number of key-value pairs.
+     * Map.of() is immutable; some methods need to add further entries after creation.
+     */
+    @SuppressWarnings("unchecked")
+    private static <V> Map<String, V> mapOf(Object... pairs) {
+        Map<String, V> m = new HashMap<>(pairs.length / 2);
+        for (int i = 0; i < pairs.length; i += 2) {
+            m.put((String) pairs[i], (V) pairs[i + 1]);
+        }
+        return m;
     }
 }
