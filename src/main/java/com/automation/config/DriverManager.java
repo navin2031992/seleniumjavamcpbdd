@@ -116,11 +116,36 @@ public class DriverManager {
 
     private static EdgeOptions buildEdgeOptions(boolean headless) {
         EdgeOptions options = new EdgeOptions();
+
         if (headless) {
             options.addArguments("--headless=new");
             options.addArguments("--window-size=1920,1080");
         }
-        options.addArguments("--no-sandbox", "--disable-dev-shm-usage");
+
+        // Stable flags — same subset that works reliably with system Edge on Windows/Mac/Linux
+        options.addArguments(
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-infobars",
+            "--remote-allow-origins=*",
+            "--lang=en-US",
+            "--disable-features=msEdgeEnableNurturingFramework",  // suppress Edge welcome screens
+            "--no-first-run",
+            "--no-default-browser-check"
+        );
+
+        // Download preferences — mirrors Chrome setup
+        Map<String, Object> prefs = new HashMap<>();
+        prefs.put("download.default_directory", config.getDownloadDir());
+        prefs.put("download.prompt_for_download", false);
+        prefs.put("profile.default_content_settings.popups", 0);
+        options.setExperimentalOption("prefs", prefs);
+        options.setPageLoadStrategy(PageLoadStrategy.NORMAL);
+
+        // WebDriverManager detects the system-installed Edge version and downloads
+        // only the matching msedgedriver binary — the browser itself is never replaced.
         WebDriverManager.edgedriver().setup();
         return options;
     }

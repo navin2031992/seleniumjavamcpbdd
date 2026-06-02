@@ -19,7 +19,7 @@ You never have to manually inspect elements again.
 
 | Tool | What it does | Key params |
 |---|---|---|
-| `start_browser` | Opens a browser window | `browser`, `options.headless` |
+| `start_browser` | Opens system Edge (default) or any browser | `browser` (default: "edge"), `options.headless` |
 | `navigate` | Goes to a URL | `url` |
 | `execute_script` | Runs JavaScript to inspect DOM | `script` |
 | `get_element_text` | Reads element text | `by`, `value` |
@@ -48,6 +48,7 @@ You never have to manually inspect elements again.
 
 Capture all elements on the login page of https://yourapp.com/login
 Page name: LoginPage
+Browser: edge   ← system-installed Edge is used by default
 ```
 
 ### Discover elements across multiple pages

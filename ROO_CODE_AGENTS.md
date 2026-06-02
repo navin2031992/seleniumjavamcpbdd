@@ -46,7 +46,7 @@
   │    (Page Objects,    │                                  │
   │    Feature files,    ▼                                  │
   │    Step defs)   Node.js process                         │
-  │                 launches Chrome/Firefox                  │
+  │                 launches system Edge/Firefox              │
   │                 navigates to your app                    │
   │                 captures DOM / screenshots               │
   │                      │                                  │
@@ -86,7 +86,7 @@ Running App ──────► [xpath-discovery]    ──► elements.json
 | Roo Code extension | AI agent | VS Code Extensions panel |
 | Java 17+ | Run the framework | `java -version` |
 | Maven 3.8+ | Build tool | `mvn -version` |
-| Chrome | Browser for tests | — |
+| Microsoft Edge | Default browser — uses system-installed Edge | — |
 | Node.js 18+ | Run MCP server | `node --version` |
 | npm | Install MCP server | `npm --version` |
 
@@ -178,7 +178,7 @@ If they are missing, check that `.roomodes` exists in the project root.
 | 🎫 Jira → BDD Test Writer | `jira-to-bdd` | Reads Jira / story → writes `.feature` files | Nothing extra |
 | 🔍 XPath Discovery Agent | `xpath-discovery` | Opens browser → captures element locators | MCP Selenium, Node.js |
 | ✍️ Test Script Writer | `test-script-writer` | Writes Page Objects + Step Definitions | Feature file + elements.json |
-| ▶️ Test Runner & Analyst | `test-runner` | Runs Maven tests → diagnoses failures → fixes | Maven, Chrome |
+| ▶️ Test Runner & Analyst | `test-runner` | Runs Maven tests → diagnoses failures → fixes | Maven, Edge (system) |
 | 🚀 Full AI Pipeline Agent | `full-pipeline` | All of the above, end-to-end | MCP Selenium, Maven |
 
 ---
@@ -194,7 +194,7 @@ Pipeline Agent call them directly through Roo Code.
 
 ```
 start_browser(browser, options)
-  browser : "chrome" | "firefox" | "edge" | "safari"
+  browser : "edge" | "chrome" | "firefox" | "safari"   ← default is "edge" (system-installed)
   options : { headless: boolean, arguments: string[] }
   ← MUST be called first before any element interaction
 
@@ -279,7 +279,7 @@ get_cookies(name?)     ← omit name to get all cookies
 delete_cookie(name?)   ← omit name to delete all cookies
 ```
 
-### Diagnostics (requires Chrome with BiDi)
+### Diagnostics (requires Edge or Chrome with WebDriver BiDi enabled)
 
 ```
 diagnostics(type, clear?)
@@ -346,7 +346,7 @@ The user is already logged in — you can use auth token: Bearer abc123
 ```
 
 **The agent will:**
-1. Call `start_browser` → open Chrome
+1. Call `start_browser` → open system-installed Edge (default)
 2. Call `add_cookie` → inject the auth token
 3. Call `navigate` → go to the profile page
 4. Read `accessibility://current` → map the DOM
@@ -518,10 +518,10 @@ If Roo Code is interrupted mid-agent, stray browser windows may remain.
 Kill them manually or run:
 ```bash
 # Windows
-taskkill /F /IM chrome.exe /T
+taskkill /F /IM msedge.exe /T
 
 # Mac/Linux
-pkill -f "Google Chrome"
+pkill -f "Microsoft Edge"
 ```
 
 ### `AmbiguousStepDefinitionsException` after generating code
@@ -571,7 +571,7 @@ Click the mode name at the top of the chat panel → select from list.
 
 ```javascript
 // Open browser (always first)
-start_browser  browser:"chrome"  options:{headless:false}
+start_browser  browser:"edge"  options:{headless:false}   ← system Edge (default)
 
 // Navigate
 navigate  url:"https://yourapp.com/login"

@@ -85,15 +85,37 @@ public class MCPSeleniumClient {
         log.info("mcp-selenium ready (PID: {})", mcpProcess.pid());
     }
 
-    /** Open a browser window. Must be called before any interact/navigate calls. */
+    /**
+     * Open a browser window using the system-installed binary.
+     * For Edge the mcp-selenium Node.js driver finds msedge.exe automatically
+     * from the OS application registry — no separate browser download occurs.
+     *
+     * @param browser  "edge" | "chrome" | "firefox" | "safari"
+     * @param headless true for CI / headless execution
+     */
     public MCPMessage startBrowser(String browser, boolean headless) {
         Map<String, Object> options = new HashMap<>();
         options.put("headless", headless);
 
+        // Edge-specific: suppress the first-run welcome screen and default-browser nag
+        if ("edge".equalsIgnoreCase(browser)) {
+            options.put("arguments", List.of(
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-features=msEdgeEnableNurturingFramework"
+            ));
+        }
+
+        log.info("Opening {} browser (headless={})", browser, headless);
         return callTool("start_browser", Map.of(
-            "browser", browser,
+            "browser", browser.toLowerCase(),
             "options", options
         ));
+    }
+
+    /** Convenience overload — uses browser and headless from ConfigManager. */
+    public MCPMessage startBrowser() {
+        return startBrowser(config.getBrowser(), config.isHeadless());
     }
 
     /** Close the active browser session (does NOT kill the Node.js process). */

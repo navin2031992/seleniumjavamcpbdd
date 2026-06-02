@@ -50,14 +50,12 @@ public class MCPSessionManager {
             }
             try {
                 client = new MCPSeleniumClient();
-                client.start();                             // Node.js process + handshake
-
-                String browser   = config.getBrowser();    // chrome / firefox / edge / safari
-                boolean headless = config.isHeadless();
-                client.startBrowser(browser, headless);    // open the browser window
+                client.start();         // Node.js process + MCP handshake
+                client.startBrowser();  // opens system-installed Edge (or configured browser)
 
                 initialized = true;
-                log.info("MCPSeleniumClient ready — {} (headless={})", browser, headless);
+                log.info("MCPSeleniumClient ready — {} (headless={})",
+                    config.getBrowser(), config.isHeadless());
             } catch (Exception e) {
                 throw new RuntimeException("Failed to start MCPSeleniumClient", e);
             }
